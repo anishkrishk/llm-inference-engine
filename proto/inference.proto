@@ -9,7 +9,7 @@ service InferenceService {
 
 message GenerateRequest {
     string request_id = 1;
-    srting prompt = 2;
+    string prompt = 2;
     uint32 max_new_tokens = 3;
     float temperature = 4;
     float top_p = 5;
