@@ -1,0 +1,22 @@
+# Core deep learning stack.
+# torch 2.3+ ships with a bundled triton on Linux/WSL2 — do not install triton
+# separately on those platforms or you will get a version skew.
+torch>=2.3,<2.6
+transformers>=4.40
+tokenizers>=0.19
+safetensors>=0.4
+
+# gRPC service layer.
+grpcio>=1.60
+grpcio-tools>=1.60
+protobuf>=4.25,<6
+
+# Numerics, plotting, configs.
+numpy>=1.26
+matplotlib>=3.8
+pyyaml>=6.0
+tqdm>=4.66
+
+# Test + dev.
+pytest>=8.0
+pytest-asyncio>=0.23

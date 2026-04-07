@@ -15,7 +15,7 @@ def make_request(request_id: str) -> inference_pb2.GenerateRequest:
         top_p=0.9,
         seed=42,
         stop_sequences=[],
-        model_id="qwen2.5-1.5b-instruct",
+        model_id="gpt2",
     )
 
 

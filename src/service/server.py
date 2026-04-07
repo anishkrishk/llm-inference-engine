@@ -5,14 +5,16 @@ from concurrent import futures
 
 import grpc
 
-from src.backends.base import GenerateInput
-from src.backends.pytorch_eager import PytorchEagerBackend
 from src.generated import inference_pb2, inference_pb2_grpc
+from src.model.types import GenerateInput
 
 
 class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
-    def __init__(self) -> None:
-        self.backend = PytorchEagerBackend()
+    def __init__(self, backend) -> None:
+        # The backend is injected so the service layer stays decoupled from
+        # the inference core. Any object exposing generate_stream() and
+        # finalize_stream() works.
+        self.backend = backend
 
     def _to_generate_input(self, request: inference_pb2.GenerateRequest) -> GenerateInput:
         return GenerateInput(
@@ -98,14 +100,12 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         )
 
 
-def serve(host: str = "0.0.0.0", port: int = 50051) -> None:
+def serve(backend, host: str = "0.0.0.0", port: int = 50051) -> None:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    inference_pb2_grpc.add_InferenceServiceServicer_to_server(InferenceService(), server)
+    inference_pb2_grpc.add_InferenceServiceServicer_to_server(
+        InferenceService(backend), server
+    )
     server.add_insecure_port(f"{host}:{port}")
     server.start()
     print(f"InferenceService listening on {host}:{port}")
     server.wait_for_termination()
-
-
-if __name__ == "__main__":
-    serve()
