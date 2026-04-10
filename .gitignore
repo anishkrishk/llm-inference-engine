@@ -209,10 +209,13 @@ __marimo__/
 # Project-specific
 .claude/
 src/generated/inference_pb2*.py
+src/generated/__init__.py
 results/*.png
 results/*.svg
 *.nsys-rep
 *.ncu-rep
 *.qdrep
+*.qdstrm
+*.sqlite
 hf_cache/
 .hf_home/
