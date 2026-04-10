@@ -474,20 +474,51 @@ _HF_CONV1D_WEIGHT_SUFFIXES = (
 )
 
 
+def _replace_linears_with_int8(module: nn.Module) -> None:
+    """
+    Recursively replace every ``nn.Linear`` in the module tree with
+    ``bitsandbytes.nn.Linear8bitLt``. The fp16 weight data is copied
+    in; bitsandbytes quantizes to int8 + absmax on the first CUDA
+    forward pass. LayerNorm and Embedding layers are left untouched
+    (quantizing those hurts quality disproportionately).
+    """
+    import bitsandbytes as bnb
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            int8_lin = bnb.nn.Linear8bitLt(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                has_fp16_weights=False,
+            )
+            int8_lin.weight = bnb.nn.Int8Params(
+                child.weight.data.clone(),
+                requires_grad=False,
+                has_fp16_weights=False,
+            )
+            if child.bias is not None:
+                int8_lin.bias = nn.Parameter(child.bias.data.clone())
+            setattr(module, name, int8_lin)
+        else:
+            _replace_linears_with_int8(child)
+
+
 def load_gpt2_from_hf(
     hf_model_name: str = "gpt2",
     dtype: torch.dtype = torch.float16,
     attention_backend: AttentionBackend = "eager",
+    quantize_int8: bool = False,
 ) -> GPT2PagedModel:
     """
     Build a GPT2PagedModel and copy weights over from a HuggingFace
     GPT2LMHeadModel checkpoint. Returns the model in eval mode.
 
-    The caller is responsible for moving the model to the target device.
+    If ``quantize_int8=True``, all Linear layers are replaced with
+    bitsandbytes ``Linear8bitLt`` after weight loading. The model must
+    be moved to CUDA before the first forward pass so bitsandbytes can
+    run its calibration quantization.
     """
-    # Imported here so that users without `transformers` installed can
-    # still import this module (e.g. for the tests that only exercise
-    # the scheduler plumbing).
     from transformers import GPT2LMHeadModel
 
     hf = GPT2LMHeadModel.from_pretrained(hf_model_name)
@@ -506,7 +537,6 @@ def load_gpt2_from_hf(
     src_sd = hf.state_dict()
     dst_sd = model.state_dict()
 
-    # Manually build a name mapping from HF's parameters to ours.
     mapping: dict[str, str] = {
         "transformer.wte.weight": "wte.weight",
         "transformer.wpe.weight": "wpe.weight",
@@ -531,14 +561,14 @@ def load_gpt2_from_hf(
             if our_key not in dst_sd:
                 raise KeyError(f"missing local parameter: {our_key}")
             tensor = src_sd[hf_key]
-            # Transpose Conv1D weights so they match nn.Linear layout.
             if any(hf_key.endswith(suffix) for suffix in _HF_CONV1D_WEIGHT_SUFFIXES):
                 tensor = tensor.t().contiguous()
             dst_sd[our_key].copy_(tensor.to(dtype))
 
-    # Convert the non-manually-copied parameters (there shouldn't be any
-    # aside from what we just copied, but convert the whole model to the
-    # target dtype for safety).
     model.to(dtype=dtype)
+
+    if quantize_int8:
+        _replace_linears_with_int8(model)
+
     model.eval()
     return model
