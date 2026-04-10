@@ -240,22 +240,29 @@ class GPT2PagedAttention(nn.Module):
         B, D = x_batch.shape
         H, d = self.num_heads, self.head_dim
 
+        torch.cuda.nvtx.range_push("qkv_proj")
         qkv = self.c_attn(x_batch)  # [B, 3D]
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.reshape(B, H, d)
         k = k.reshape(B, H, d)
         v = v.reshape(B, H, d)
+        torch.cuda.nvtx.range_pop()
 
-        # Batched scatter write: one op for all B sequences.
+        torch.cuda.nvtx.range_push("kv_write")
         kv_pool.write_decode_batch(layer_idx, block_tables_2d, positions, k, v)
+        torch.cuda.nvtx.range_pop()
 
-        # Batched paged decode: one kernel launch for all (head, seq) pairs.
+        torch.cuda.nvtx.range_push("paged_attn")
         attn_out = batched_paged_decode_attention(
             q, kv_pool.k_cache, kv_pool.v_cache,
             block_tables_2d, context_lens, layer_idx,
         )  # [B, H, d]
+        torch.cuda.nvtx.range_pop()
 
-        return self.c_proj(attn_out.reshape(B, D))
+        torch.cuda.nvtx.range_push("out_proj")
+        result = self.c_proj(attn_out.reshape(B, D))
+        torch.cuda.nvtx.range_pop()
+        return result
 
 
 # ----------------------------------------------------------------------
@@ -394,11 +401,12 @@ class GPT2PagedModel(nn.Module):
         device = input_ids.device
         positions = torch.arange(start_pos, start_pos + L, device=device)
 
-        # Token + learned absolute position embedding.
+        torch.cuda.nvtx.range_push("embedding")
         x = self.wte(input_ids) + self.wpe(positions)  # [L, D]
+        torch.cuda.nvtx.range_pop()
 
-        # Run through every transformer block.
         for layer_idx, block in enumerate(self.blocks):
+            torch.cuda.nvtx.range_push(f"block_{layer_idx}")
             x = block(
                 x,
                 layer_idx=layer_idx,
@@ -406,10 +414,12 @@ class GPT2PagedModel(nn.Module):
                 block_ids=block_ids,
                 kv_pool=kv_pool,
             )
+            torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("lm_head")
         x = self.ln_f(x)
-        # Weight-tied LM head: logits = x @ wte.weight.T
         logits = x @ self.wte.weight.t()  # [L, V]
+        torch.cuda.nvtx.range_pop()
         return logits
 
     @torch.inference_mode()
@@ -440,9 +450,13 @@ class GPT2PagedModel(nn.Module):
         logits : [B, V]
         """
         B = input_ids.shape[0]
+
+        torch.cuda.nvtx.range_push("embedding")
         x = self.wte(input_ids) + self.wpe(positions)  # [B, D]
+        torch.cuda.nvtx.range_pop()
 
         for layer_idx, block in enumerate(self.blocks):
+            torch.cuda.nvtx.range_push(f"block_{layer_idx}")
             x = block.decode_batch(
                 x,
                 layer_idx=layer_idx,
@@ -451,9 +465,12 @@ class GPT2PagedModel(nn.Module):
                 context_lens=context_lens,
                 kv_pool=kv_pool,
             )
+            torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("lm_head")
         x = self.ln_f(x)
         logits = x @ self.wte.weight.t()  # [B, V]
+        torch.cuda.nvtx.range_pop()
         return logits
 
 
