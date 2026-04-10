@@ -39,6 +39,10 @@ def main() -> None:
     parser.add_argument("--max-new", type=int, default=40)
     parser.add_argument("--num-blocks", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--backend", choices=["eager", "triton"], default="eager",
+        help="attention kernel backend",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -53,9 +57,11 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     prompt_ids = tokenizer(args.prompt, return_tensors="pt").input_ids[0].tolist()
 
-    print(f"loading gpt2 (124M) in fp16 on {device}...")
+    print(f"loading gpt2 (124M) in fp16 on {device} (attention backend: {args.backend})...")
     t0 = time.perf_counter()
-    model = load_gpt2_from_hf("gpt2", dtype=dtype).to(device).eval()
+    model = load_gpt2_from_hf(
+        "gpt2", dtype=dtype, attention_backend=args.backend
+    ).to(device).eval()
     load_s = time.perf_counter() - t0
 
     gpt2_cfg = GPT2Config.gpt2_small()

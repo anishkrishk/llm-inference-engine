@@ -34,7 +34,8 @@ def _load_hf_gpt2():
     return hf, tok
 
 
-def test_gpt2_matches_hf_greedy() -> None:
+@pytest.mark.parametrize("backend", ["eager", "triton"])
+def test_gpt2_matches_hf_greedy(backend: str) -> None:
     from src.kv_cache.allocator import BlockAllocator  # noqa: F401  (import smoke)
     from src.kv_cache.kv_pool import KVPool, KVPoolConfig
     from src.model.gpt2 import GPT2Config, load_gpt2_from_hf
@@ -75,7 +76,7 @@ def test_gpt2_matches_hf_greedy() -> None:
         device=device,
     )
     kv_pool = KVPool(pool_cfg)
-    model = load_gpt2_from_hf("gpt2", dtype=dtype).to(device).eval()
+    model = load_gpt2_from_hf("gpt2", dtype=dtype, attention_backend=backend).to(device).eval()
     runner = GPT2Runner(model, kv_pool)
     engine = Engine(
         EngineConfig(

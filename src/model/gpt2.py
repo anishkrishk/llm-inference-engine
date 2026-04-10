@@ -33,13 +33,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence as SequenceT
+from typing import Literal, Sequence as SequenceT
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.kv_cache.kv_pool import KVPool
+
+AttentionBackend = Literal["eager", "triton"]
 
 
 @dataclass(frozen=True)
@@ -89,11 +91,19 @@ class GPT2PagedAttention(nn.Module):
     Returns the attention output of shape [L, D].
     """
 
-    def __init__(self, config: GPT2Config) -> None:
+    def __init__(
+        self, config: GPT2Config, attention_backend: AttentionBackend = "eager"
+    ) -> None:
         super().__init__()
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
+        if attention_backend not in ("eager", "triton"):
+            raise ValueError(
+                f"unknown attention_backend {attention_backend!r}; "
+                f"expected 'eager' or 'triton'"
+            )
+        self._backend: AttentionBackend = attention_backend
         # HF fuses Q, K, V into one projection called c_attn.
         self.c_attn = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
         self.c_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
@@ -116,9 +126,9 @@ class GPT2PagedAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
 
         # Reshape [L, D] -> [L, H, d] so each head sees its own d-wide slice.
-        q = q.view(L, H, d)
-        k = k.view(L, H, d)
-        v = v.view(L, H, d)
+        q = q.reshape(L, H, d)
+        k = k.reshape(L, H, d)
+        v = v.reshape(L, H, d)
 
         # Scatter the newly-computed K,V into the paged cache at the
         # positions [start_pos, start_pos + L).
@@ -130,33 +140,51 @@ class GPT2PagedAttention(nn.Module):
         T = start_pos + L
         k_cache, v_cache = kv_pool.read(layer_idx, block_ids, T)  # [T, H, d] each
 
-        # Move the head axis up front so the attention matmul is clean:
-        # q:     [H, L, d]
-        # k/v:   [H, T, d]
+        if self._backend == "triton":
+            out = self._triton_attention(q, k_cache, v_cache)
+        else:
+            out = self._eager_attention(q, k_cache, v_cache, L, T, x.device)
+
+        out = out.reshape(L, D)
+        return self.c_proj(out)
+
+    # ------------------------------------------------------------------
+    # Backends
+    # ------------------------------------------------------------------
+
+    def _eager_attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        L: int,
+        T: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Pure-PyTorch materialized causal attention. Reference for the kernel."""
         q_h = q.transpose(0, 1)            # [H, L, d]
         k_h = k_cache.transpose(0, 1)      # [H, T, d]
         v_h = v_cache.transpose(0, 1)      # [H, T, d]
-
-        # scores[h, i, j] = q_h[h, i] . k_h[h, j]
         scores = torch.matmul(q_h, k_h.transpose(-1, -2)) * self._scale  # [H, L, T]
-
-        # Causal mask: token i (at absolute position start_pos + i) can
-        # attend to positions 0..start_pos+i. Vectorized construction.
-        q_pos = torch.arange(start_pos, start_pos + L, device=x.device)  # [L]
-        k_pos = torch.arange(T, device=x.device)                          # [T]
-        # True where the key position is *after* the query position.
-        mask = k_pos[None, :] > q_pos[:, None]  # [L, T]
-        # Broadcast over heads and apply.
+        q_pos = torch.arange(T - L, T, device=device)  # [L]
+        k_pos = torch.arange(T, device=device)         # [T]
+        mask = k_pos[None, :] > q_pos[:, None]
         scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
-
-        # Softmax over the key axis. Upcast to fp32 inside the softmax
-        # for numerical stability with fp16 scores.
         attn = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
-
-        # Weighted sum of values.
         out = torch.matmul(attn, v_h)                    # [H, L, d]
-        out = out.transpose(0, 1).contiguous().view(L, D)  # [L, D]
-        return self.c_proj(out)
+        return out.transpose(0, 1).contiguous()          # [L, H, d]
+
+    def _triton_attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Triton FlashAttention path. Causal with queries trailing the cache."""
+        # Imported lazily so importing this module on a CUDA-less box is fine.
+        from src.kernels.triton.flash_attention import triton_flash_attention
+
+        return triton_flash_attention(q, k_cache, v_cache, causal=True)
 
 
 # ----------------------------------------------------------------------
@@ -193,12 +221,14 @@ class GPT2Block(nn.Module):
         x'' = x' + mlp(ln_2(x'))
     """
 
-    def __init__(self, config: GPT2Config) -> None:
+    def __init__(
+        self, config: GPT2Config, attention_backend: AttentionBackend = "eager"
+    ) -> None:
         super().__init__()
         d = config.hidden_size
         eps = config.layer_norm_epsilon
         self.ln_1 = nn.LayerNorm(d, eps=eps)
-        self.attn = GPT2PagedAttention(config)
+        self.attn = GPT2PagedAttention(config, attention_backend=attention_backend)
         self.ln_2 = nn.LayerNorm(d, eps=eps)
         self.mlp = GPT2MLP(config)
 
@@ -227,14 +257,20 @@ class GPT2Block(nn.Module):
 
 
 class GPT2PagedModel(nn.Module):
-    def __init__(self, config: GPT2Config) -> None:
+    def __init__(
+        self, config: GPT2Config, attention_backend: AttentionBackend = "eager"
+    ) -> None:
         super().__init__()
         self.config = config
+        self.attention_backend: AttentionBackend = attention_backend
         d = config.hidden_size
         self.wte = nn.Embedding(config.vocab_size, d)
         self.wpe = nn.Embedding(config.max_position_embeddings, d)
         self.blocks = nn.ModuleList(
-            [GPT2Block(config) for _ in range(config.num_layers)]
+            [
+                GPT2Block(config, attention_backend=attention_backend)
+                for _ in range(config.num_layers)
+            ]
         )
         self.ln_f = nn.LayerNorm(d, eps=config.layer_norm_epsilon)
         # LM head is weight-tied to wte (see forward()) — no parameter here.
@@ -305,6 +341,7 @@ _HF_CONV1D_WEIGHT_SUFFIXES = (
 def load_gpt2_from_hf(
     hf_model_name: str = "gpt2",
     dtype: torch.dtype = torch.float16,
+    attention_backend: AttentionBackend = "eager",
 ) -> GPT2PagedModel:
     """
     Build a GPT2PagedModel and copy weights over from a HuggingFace
@@ -328,7 +365,7 @@ def load_gpt2_from_hf(
         max_position_embeddings=hf_cfg.n_positions,
         layer_norm_epsilon=hf_cfg.layer_norm_epsilon,
     )
-    model = GPT2PagedModel(cfg)
+    model = GPT2PagedModel(cfg, attention_backend=attention_backend)
 
     src_sd = hf.state_dict()
     dst_sd = model.state_dict()
