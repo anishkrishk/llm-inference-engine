@@ -123,7 +123,7 @@ class KVPool:
     def write(
         self,
         layer_idx: int,
-        block_ids: SequenceT[int],
+        block_ids,
         start_pos: int,
         k_new: torch.Tensor,
         v_new: torch.Tensor,
@@ -134,7 +134,8 @@ class KVPool:
         Arguments
         ---------
         layer_idx:  which transformer layer's slab to write into.
-        block_ids:  the full block table for this sequence (physical ids).
+        block_ids:  the block table — a Python list/sequence of ints OR
+                    a 1-D torch.Tensor already on the same device.
         start_pos:  logical position of the first new token.
         k_new:      tensor of shape [L, num_heads, head_dim]
         v_new:      tensor of shape [L, num_heads, head_dim]
@@ -155,28 +156,73 @@ class KVPool:
 
         # positions[i] = logical position of the i-th new token
         positions = torch.arange(start_pos, start_pos + L, device=device)
-        # For each position, which entry of the block table do we need
-        # (logical block index) and which slot within that block.
         logical_block = positions // block_size    # [L]
         slot = positions % block_size              # [L]
 
-        # Translate the logical block index into a physical block id.
-        # We only need the slice of block_ids we're actually touching.
         max_logical = int(logical_block.max().item()) + 1
-        if max_logical > len(block_ids):
-            raise IndexError(
-                f"write would touch logical block {max_logical - 1} but the "
-                f"block table only has {len(block_ids)} entries"
+
+        # Accept either a Python list or a CUDA tensor for block_ids.
+        # The batched runner passes pre-built tensors to avoid repeated
+        # CPU->GPU transfers across layers.
+        if isinstance(block_ids, torch.Tensor):
+            if block_ids.shape[0] < max_logical:
+                raise IndexError(
+                    f"write would touch logical block {max_logical - 1} but the "
+                    f"block table only has {block_ids.shape[0]} entries"
+                )
+            block_table_tensor = block_ids[:max_logical].to(
+                device=device, dtype=torch.long
             )
-        block_table_tensor = torch.as_tensor(
-            list(block_ids[:max_logical]), device=device, dtype=torch.long
-        )
+        else:
+            if max_logical > len(block_ids):
+                raise IndexError(
+                    f"write would touch logical block {max_logical - 1} but the "
+                    f"block table only has {len(block_ids)} entries"
+                )
+            block_table_tensor = torch.as_tensor(
+                list(block_ids[:max_logical]), device=device, dtype=torch.long
+            )
         physical = block_table_tensor[logical_block]   # [L]
 
         # Advanced indexing scatter write. The three index tensors are
         # broadcast together; assignment fills the matching slots.
         self._k[layer_idx, physical, slot] = k_new
         self._v[layer_idx, physical, slot] = v_new
+
+    def write_decode_batch(
+        self,
+        layer_idx: int,
+        block_tables: torch.Tensor,
+        positions: torch.Tensor,
+        k_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+    ) -> None:
+        """
+        Scatter-write one KV pair per sequence for a batch of B sequences.
+
+        This replaces B individual write() calls with a single vectorized
+        scatter, eliminating B-1 Python call frames per layer per step.
+
+        Args
+        ----
+        layer_idx    : transformer layer index
+        block_tables : [B, max_blocks] int32 CUDA tensor (physical block ids)
+        positions    : [B] int64 CUDA tensor (the position to write each seq)
+        k_batch      : [B, H, D] fp16 CUDA tensor (one token per seq)
+        v_batch      : [B, H, D] fp16 CUDA tensor
+        """
+        B = k_batch.shape[0]
+        block_size = self._cfg.block_size
+        logical_block = positions // block_size  # [B]
+        slot = positions % block_size            # [B]
+
+        # Gather each sequence's physical block id from its row of block_tables.
+        batch_idx = torch.arange(B, device=positions.device)
+        physical = block_tables[batch_idx, logical_block.long()].long()  # [B]
+
+        # Scatter write: one slot per sequence, all in one advanced-indexing op.
+        self._k[layer_idx, physical, slot] = k_batch
+        self._v[layer_idx, physical, slot] = v_batch
 
     # ------------------------------------------------------------------
     # Read path

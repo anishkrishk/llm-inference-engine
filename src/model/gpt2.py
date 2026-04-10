@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal, Sequence as SequenceT
+from typing import List, Literal, Sequence as SequenceT
 
 import torch
 import torch.nn as nn
@@ -206,10 +206,6 @@ class GPT2PagedAttention(nn.Module):
         """
         from src.kernels.triton.paged_decode import paged_decode_attention
 
-        # NOTE: building the block-table tensor per layer is wasteful
-        # (12 CPU->GPU transfers per token for GPT-2 small). The async
-        # batched runner will hoist this above the per-layer loop and
-        # reuse one tensor across all layers in a step.
         block_table = torch.as_tensor(
             list(block_ids), dtype=torch.int32, device=q.device
         )
@@ -221,6 +217,45 @@ class GPT2PagedAttention(nn.Module):
             context_len=context_len,
             layer_idx=layer_idx,
         )
+
+    def decode_batch(
+        self,
+        x_batch: torch.Tensor,
+        layer_idx: int,
+        positions: torch.Tensor,
+        block_tables_2d: torch.Tensor,
+        context_lens: torch.Tensor,
+        kv_pool: KVPool,
+    ) -> torch.Tensor:
+        """
+        Fully batched decode: projects Q/K/V in one matmul, writes all
+        K/V in one vectorized scatter, runs paged attention for all B
+        sequences in one kernel launch. Returns [B, D].
+
+        block_tables_2d : [B, max_blocks] int32 CUDA tensor (padded)
+        context_lens    : [B] int32 CUDA tensor
+        """
+        from src.kernels.triton.paged_decode import batched_paged_decode_attention
+
+        B, D = x_batch.shape
+        H, d = self.num_heads, self.head_dim
+
+        qkv = self.c_attn(x_batch)  # [B, 3D]
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.reshape(B, H, d)
+        k = k.reshape(B, H, d)
+        v = v.reshape(B, H, d)
+
+        # Batched scatter write: one op for all B sequences.
+        kv_pool.write_decode_batch(layer_idx, block_tables_2d, positions, k, v)
+
+        # Batched paged decode: one kernel launch for all (head, seq) pairs.
+        attn_out = batched_paged_decode_attention(
+            q, kv_pool.k_cache, kv_pool.v_cache,
+            block_tables_2d, context_lens, layer_idx,
+        )  # [B, H, d]
+
+        return self.c_proj(attn_out.reshape(B, D))
 
 
 # ----------------------------------------------------------------------
@@ -281,6 +316,27 @@ class GPT2Block(nn.Module):
             layer_idx=layer_idx,
             start_pos=start_pos,
             block_ids=block_ids,
+            kv_pool=kv_pool,
+        )
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+    def decode_batch(
+        self,
+        x: torch.Tensor,
+        layer_idx: int,
+        positions: torch.Tensor,
+        block_tables_2d: torch.Tensor,
+        context_lens: torch.Tensor,
+        kv_pool: KVPool,
+    ) -> torch.Tensor:
+        """Fully batched decode: all linears, writes, and attention batched."""
+        x = x + self.attn.decode_batch(
+            self.ln_1(x),
+            layer_idx=layer_idx,
+            positions=positions,
+            block_tables_2d=block_tables_2d,
+            context_lens=context_lens,
             kv_pool=kv_pool,
         )
         x = x + self.mlp(self.ln_2(x))
@@ -354,6 +410,50 @@ class GPT2PagedModel(nn.Module):
         x = self.ln_f(x)
         # Weight-tied LM head: logits = x @ wte.weight.T
         logits = x @ self.wte.weight.t()  # [L, V]
+        return logits
+
+    @torch.inference_mode()
+    def decode_batch(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_tables_2d: torch.Tensor,
+        context_lens: torch.Tensor,
+        kv_pool: KVPool,
+    ) -> torch.Tensor:
+        """
+        Fully batched decode forward for B sequences each generating one
+        token. All embeddings, linear projections, LayerNorms, MLP, KV
+        writes, and paged attention are batched over the B dimension in a
+        single call per layer.
+
+        Args
+        ----
+        input_ids      : [B]   one token per sequence
+        positions      : [B]   absolute position per sequence
+        block_tables_2d: [B, max_blocks] int32 CUDA — padded block tables
+        context_lens   : [B] int32 CUDA — positions + 1
+        kv_pool        : shared KV cache
+
+        Returns
+        -------
+        logits : [B, V]
+        """
+        B = input_ids.shape[0]
+        x = self.wte(input_ids) + self.wpe(positions)  # [B, D]
+
+        for layer_idx, block in enumerate(self.blocks):
+            x = block.decode_batch(
+                x,
+                layer_idx=layer_idx,
+                positions=positions,
+                block_tables_2d=block_tables_2d,
+                context_lens=context_lens,
+                kv_pool=kv_pool,
+            )
+
+        x = self.ln_f(x)
+        logits = x @ self.wte.weight.t()  # [B, V]
         return logits
 
 

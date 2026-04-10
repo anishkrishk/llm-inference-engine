@@ -160,6 +160,135 @@ def _paged_decode_kernel(
     tl.store(o_ptrs, out.to(Out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _batched_paged_decode_kernel(
+    Q_ptr,
+    K_cache_ptr, V_cache_ptr,
+    Out_ptr,
+    block_tables_ptr,
+    context_lens_ptr,
+    stride_q_b, stride_q_h, stride_q_d,
+    stride_k_layer, stride_k_block, stride_k_slot, stride_k_head, stride_k_d,
+    stride_v_layer, stride_v_block, stride_v_slot, stride_v_head, stride_v_d,
+    stride_o_b, stride_o_h, stride_o_d,
+    stride_bt_b, stride_bt_n,
+    layer_idx,
+    sm_scale,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """One program per (head, sequence). Grid = (num_heads, batch_size)."""
+    off_h = tl.program_id(0)
+    off_b = tl.program_id(1)
+
+    context_len = tl.load(context_lens_ptr + off_b).to(tl.int32)
+
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_slot = tl.arange(0, BLOCK_SIZE)
+
+    q_ptrs = Q_ptr + off_b * stride_q_b + off_h * stride_q_h + offs_d * stride_q_d
+    q = tl.load(q_ptrs).to(tl.float32)
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    num_blocks_used = tl.cdiv(context_len, BLOCK_SIZE)
+
+    for block_idx in range(0, num_blocks_used):
+        physical_block = tl.load(
+            block_tables_ptr + off_b * stride_bt_b + block_idx * stride_bt_n
+        ).to(tl.int64)
+
+        k_ptrs = (
+            K_cache_ptr
+            + layer_idx * stride_k_layer
+            + physical_block * stride_k_block
+            + offs_slot[:, None] * stride_k_slot
+            + off_h * stride_k_head
+            + offs_d[None, :] * stride_k_d
+        )
+        v_ptrs = (
+            V_cache_ptr
+            + layer_idx * stride_v_layer
+            + physical_block * stride_v_block
+            + offs_slot[:, None] * stride_v_slot
+            + off_h * stride_v_head
+            + offs_d[None, :] * stride_v_d
+        )
+
+        block_start = block_idx * BLOCK_SIZE
+        positions = block_start + offs_slot
+        valid = positions < context_len
+
+        k = tl.load(k_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
+
+        scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
+        scores = tl.where(valid, scores, -float("inf"))
+
+        m_block = tl.max(scores, axis=0)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_new
+
+    out = acc / l_i
+    o_ptrs = Out_ptr + off_b * stride_o_b + off_h * stride_o_h + offs_d * stride_o_d
+    tl.store(o_ptrs, out.to(Out_ptr.dtype.element_ty))
+
+
+def batched_paged_decode_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    layer_idx: int,
+) -> torch.Tensor:
+    """
+    Batched version: process B sequences in one kernel launch.
+
+    Arguments
+    ---------
+    q            : [B, H, D] fp16, CUDA
+    k_cache      : [num_layers, num_blocks, block_size, H, D] fp16
+    v_cache      : same
+    block_tables : [B, max_num_blocks] int32, CUDA — padded to max length
+    context_lens : [B] int32, CUDA — per-sequence context lengths
+    layer_idx    : int
+
+    Returns
+    -------
+    out : [B, H, D] fp16
+    """
+    B, H, D = q.shape
+    block_size = k_cache.shape[2]
+    out = torch.empty_like(q)
+    sm_scale = 1.0 / math.sqrt(D)
+
+    grid = (H, B)
+
+    _batched_paged_decode_kernel[grid](
+        q, k_cache, v_cache, out, block_tables, context_lens,
+        q.stride(0), q.stride(1), q.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        k_cache.stride(3), k_cache.stride(4),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        v_cache.stride(3), v_cache.stride(4),
+        out.stride(0), out.stride(1), out.stride(2),
+        block_tables.stride(0), block_tables.stride(1),
+        layer_idx,
+        sm_scale=sm_scale,
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=D,
+    )
+    return out
+
+
 def paged_decode_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
