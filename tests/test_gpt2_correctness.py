@@ -34,7 +34,7 @@ def _load_hf_gpt2():
     return hf, tok
 
 
-@pytest.mark.parametrize("backend", ["eager", "triton"])
+@pytest.mark.parametrize("backend", ["eager", "triton", "paged"])
 def test_gpt2_matches_hf_greedy(backend: str) -> None:
     from src.kv_cache.allocator import BlockAllocator  # noqa: F401  (import smoke)
     from src.kv_cache.kv_pool import KVPool, KVPoolConfig

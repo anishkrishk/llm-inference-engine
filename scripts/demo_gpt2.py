@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--num-blocks", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument(
-        "--backend", choices=["eager", "triton"], default="eager",
+        "--backend", choices=["eager", "triton", "paged"], default="eager",
         help="attention kernel backend",
     )
     args = parser.parse_args()

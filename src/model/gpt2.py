@@ -41,7 +41,7 @@ import torch.nn.functional as F
 
 from src.kv_cache.kv_pool import KVPool
 
-AttentionBackend = Literal["eager", "triton"]
+AttentionBackend = Literal["eager", "triton", "paged"]
 
 
 @dataclass(frozen=True)
@@ -98,10 +98,10 @@ class GPT2PagedAttention(nn.Module):
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
-        if attention_backend not in ("eager", "triton"):
+        if attention_backend not in ("eager", "triton", "paged"):
             raise ValueError(
                 f"unknown attention_backend {attention_backend!r}; "
-                f"expected 'eager' or 'triton'"
+                f"expected 'eager', 'triton', or 'paged'"
             )
         self._backend: AttentionBackend = attention_backend
         # HF fuses Q, K, V into one projection called c_attn.
@@ -134,16 +134,21 @@ class GPT2PagedAttention(nn.Module):
         # positions [start_pos, start_pos + L).
         kv_pool.write(layer_idx, block_ids, start_pos, k, v)
 
-        # Gather the full history of K,V for this sequence back from the
-        # cache. T = total tokens currently cached (including the ones
-        # we just wrote above).
         T = start_pos + L
-        k_cache, v_cache = kv_pool.read(layer_idx, block_ids, T)  # [T, H, d] each
 
-        if self._backend == "triton":
-            out = self._triton_attention(q, k_cache, v_cache)
+        # The "paged" backend skips the gather entirely on the decode
+        # path (L == 1) and reads K,V directly from the pool tensors
+        # via a Triton kernel that walks the block table. For prefill
+        # (L > 1) it falls back to the same triton FA path the
+        # "triton" backend uses.
+        if self._backend == "paged" and L == 1:
+            out = self._paged_decode(q, layer_idx, block_ids, T, kv_pool)
         else:
-            out = self._eager_attention(q, k_cache, v_cache, L, T, x.device)
+            k_cache, v_cache = kv_pool.read(layer_idx, block_ids, T)
+            if self._backend in ("triton", "paged"):
+                out = self._triton_attention(q, k_cache, v_cache)
+            else:
+                out = self._eager_attention(q, k_cache, v_cache, L, T, x.device)
 
         out = out.reshape(L, D)
         return self.c_proj(out)
@@ -185,6 +190,37 @@ class GPT2PagedAttention(nn.Module):
         from src.kernels.triton.flash_attention import triton_flash_attention
 
         return triton_flash_attention(q, k_cache, v_cache, causal=True)
+
+    def _paged_decode(
+        self,
+        q: torch.Tensor,
+        layer_idx: int,
+        block_ids: SequenceT[int],
+        context_len: int,
+        kv_pool: KVPool,
+    ) -> torch.Tensor:
+        """
+        Single-query attention via the paged decode kernel. Reads K,V
+        directly from the pool tensors using the block table; no
+        intermediate gather.
+        """
+        from src.kernels.triton.paged_decode import paged_decode_attention
+
+        # NOTE: building the block-table tensor per layer is wasteful
+        # (12 CPU->GPU transfers per token for GPT-2 small). The async
+        # batched runner will hoist this above the per-layer loop and
+        # reuse one tensor across all layers in a step.
+        block_table = torch.as_tensor(
+            list(block_ids), dtype=torch.int32, device=q.device
+        )
+        return paged_decode_attention(
+            q,
+            kv_pool.k_cache,
+            kv_pool.v_cache,
+            block_table,
+            context_len=context_len,
+            layer_idx=layer_idx,
+        )
 
 
 # ----------------------------------------------------------------------
