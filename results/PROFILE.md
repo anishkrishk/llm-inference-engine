@@ -1,6 +1,6 @@
 # Profiling Analysis
 
-**Tool:** `torch.profiler` with CUDA activity tracing + NVTX annotations  
+**Tools:** Nsight Systems (`nsys`) with NVTX annotations + `torch.profiler` with CUDA activity tracing  
 **Workload:** 5 concurrent requests (prompts 16–128 tokens, 20 output tokens each), 10 profiled engine steps after 5 warmup steps  
 **Backend:** paged attention (Triton FlashAttention prefill, batched paged decode)
 
@@ -12,9 +12,47 @@ to get a full timeline with GPU kernel correlation.
 
 ---
 
-## Where time is spent
+## Nsight Systems NVTX breakdown
 
-From the `torch.profiler` summary across 10 engine steps (93.8 ms total CPU time):
+Nsight Systems captured NVTX-annotated wall-clock time per model region.
+Median values across 10 engine steps (5 concurrent decode sequences):
+
+| NVTX Range | Median per call | Calls | What it is |
+|---|---|---|---|
+| `engine_step` | **10.4 ms** | 10 | One full scheduler step (all 5 seqs) |
+| `block_N` (each) | **~770 us** | 17 each | One transformer block (12 per step, some prefill steps have all 12) |
+| `kv_write` | **228 us** | 144 | Batched scatter write of K,V for all seqs |
+| `paged_attn` | **74 us** | 144 | Batched paged decode attention kernel |
+| `qkv_proj` | **70 us** | 144 | Batched Q/K/V linear projection |
+| `out_proj` | **66 us** | 144 | Batched attention output projection |
+| `embedding` | **118 us** | 17 | Token + position embeddings |
+| `lm_head` | **138 us** | 17 | Final LayerNorm + weight-tied LM head |
+
+Per-step breakdown (12 blocks × ~770 us + embedding + lm_head ≈ **9.5 ms** GPU work + ~1 ms Python/scheduler overhead = ~10.4 ms total).
+
+Inside each transformer block (per-layer):
+- `kv_write`: 228 us (29%)
+- `paged_attn`: 74 us (10%)
+- `qkv_proj`: 70 us (9%)
+- `out_proj`: 66 us (9%)
+- Unlabeled (LayerNorm, MLP, residual, Python): ~332 us (43%)
+
+## Nsight Systems CUDA API breakdown
+
+| CUDA API | Calls | Total time | Median | What it is |
+|---|---|---|---|---|
+| `cudaLaunchKernel` | 3018 | 168.1 ms | 12.4 us | PyTorch op kernel launches |
+| `cuLaunchKernel` | 797 | 12.6 ms | 14.5 us | Triton kernel launches |
+| `cudaMemcpyAsync` | 446 | 31.5 ms | 14.6 us | Block table CPU→GPU transfers |
+| `cudaStreamSynchronize` | 446 | 20.9 ms | 22.2 us | Forced CPU-GPU syncs |
+
+**~3815 kernel launches per 10 steps = ~382 per step.** At ~14 us median per launch, **~5.3 ms of pure launch overhead per step**, or roughly **51% of the 10.4 ms step time**.
+
+---
+
+## torch.profiler op-level breakdown
+
+From `torch.profiler` across the same 10 steps (93.8 ms total CPU time):
 
 | Category | Self CPU time | % of total | # Calls | What it is |
 |---|---|---|---|---|
