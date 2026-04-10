@@ -24,12 +24,12 @@
  *        running weighted output acc)
  *   After all blocks: normalizes acc / l and writes the output.
  *
- * Why CUDA instead of Triton for this exercise:
+ * Why a CUDA implementation alongside Triton:
  *   - Explicit shared-memory reductions (warp shuffles, __syncthreads)
  *   - Direct control over thread/block geometry
- *   - Understanding of the GPU execution model at a lower level
- *   - The kernel is functionally identical to the Triton version;
- *     the difference is in the level of abstraction, not the math
+ *   - Finer-grained control over the GPU execution model
+ *   - Functionally identical to the Triton version; the difference
+ *     is in the level of abstraction, not the math
  */
 
 #include <torch/extension.h>

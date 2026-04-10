@@ -131,9 +131,7 @@ Open `results/profile_trace.json` at [ui.perfetto.dev](https://ui.perfetto.dev/)
 
 ---
 
-## How to read the trace (teaching notes)
-
-If an interviewer asks "walk me through what you see in a profile of your engine":
+## How to read the trace
 
 1. **Open the Chrome trace.** The top rows are CPU threads; the bottom rows are CUDA streams. Time flows left to right.
 
@@ -141,8 +139,6 @@ If an interviewer asks "walk me through what you see in a profile of your engine
 
 3. **Look at the GPU stream below.** You'll see a staircase of small kernels (addmm, layer_norm, the Triton paged attention kernel) with tiny gaps between them. The gaps are CPU dispatch latency.
 
-4. **The key insight:** the GPU is spending significant time *idle* between kernels, waiting for the CPU to launch the next one. This is why kernel launch overhead (32%) is the #1 bottleneck. The GPU compute itself (addmm, attention) is efficient when it runs, but it's underutilized because of the launch cadence.
+4. **The key insight:** the GPU spends significant time *idle* between kernels, waiting for the CPU to launch the next one. Kernel launch overhead (51%) is the #1 bottleneck. The GPU compute itself (addmm, attention) is efficient within each kernel but underutilized because of the launch cadence.
 
-5. **What `torch.compile` would change:** it would fuse adjacent operations into fewer, larger kernels, closing the gaps. What CUDA graphs would change: they'd record the kernel sequence once and replay it without any per-kernel CPU dispatch, eliminating the gaps entirely.
-
-6. **What you should say in an interview:** "The profile shows that at small batch sizes on GPT-2, kernel launch overhead dominates — 32% of wall time is just the CPU dispatching work to the GPU. The actual GPU compute (linear projections, attention) is efficient within each kernel. The next optimization step would be `torch.compile` or CUDA graphs to amortize the launch overhead, which is the standard production path for PyTorch inference."
+5. **What `torch.compile` would change:** it fuses adjacent operations into fewer, larger kernels, closing the gaps. CUDA graphs would record the kernel sequence once and replay it without per-kernel CPU dispatch, eliminating the gaps entirely.

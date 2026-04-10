@@ -2,8 +2,7 @@
 Comprehensive benchmark suite for the LLM inference engine.
 
 Runs three benchmark groups and produces matplotlib charts saved to
-results/. This is the script that backs every number on the resume
-with reproducible evidence.
+results/. Every number is reproducible by re-running this script.
 
 Groups:
   1. Attention kernel microbench — naive vs SDPA vs Triton FA at

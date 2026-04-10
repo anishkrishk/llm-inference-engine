@@ -60,7 +60,7 @@ def triton_gather_attention(
     context_len: int,
     layer_idx: int,
 ) -> torch.Tensor:
-    """Phase 3 path: gather K,V then run the FlashAttention forward kernel."""
+    """Gather K,V from pool then run the FlashAttention forward kernel."""
     k_cache, v_cache = pool.read(layer_idx, block_ids, context_len)  # [ctx, H, D]
     return triton_flash_attention(q, k_cache, v_cache, causal=True)
 
@@ -72,7 +72,7 @@ def paged_direct_attention(
     context_len: int,
     layer_idx: int,
 ) -> torch.Tensor:
-    """Phase 4 path: skip the gather, kernel walks the block table itself."""
+    """Skip the gather; kernel walks the block table directly."""
     return paged_decode_attention(
         q, pool.k_cache, pool.v_cache, block_table, context_len, layer_idx
     )

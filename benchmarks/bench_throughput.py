@@ -2,7 +2,7 @@
 Throughput comparison: our engine (batched continuous batching) vs
 HuggingFace's model.generate() processing the same requests sequentially.
 
-This benchmark produces the "Xx throughput" number for the resume.
+Produces the aggregate throughput comparison number.
 
 Workload: 20 requests with prompt lengths 16–256 and max_new_tokens
 32–64, drawn from a seeded RNG for reproducibility. The distribution
